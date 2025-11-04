@@ -379,41 +379,55 @@ async syncContacts() {
             logger.warn('⚠️ WhatsApp not connected, skipping contact sync');
             return;
         }
-        
+
         logger.info('📞 Syncing contacts from WhatsApp...');
-        
+
         const contacts = this.whatsappBot.sock.store?.contacts || {};
         const contactEntries = Object.entries(contacts);
-        
+
         logger.debug(`🔍 Found ${contactEntries.length} contacts in WhatsApp store`);
-        
+
         let syncedCount = 0;
-        
+        let savedCount = 0;
+
         for (const [jid, contact] of contactEntries) {
             if (!jid || jid === 'status@broadcast' || !contact) continue;
-            
-            // ✅ Get phone number first
-            let phone = contact.phoneNumber ? contact.phoneNumber.split('@')[0] : jid.split('@')[0];
-            let contactName = null;
-            
-            // 🧩 Optional: Resolve LID numbers that look random (e.g., 123299954745387)
-            if (!phone || phone.startsWith('lid_') || phone.length < 10) {
-                const lidMapping = this.whatsappBot.sock?.signalRepository?.lidMapping;
-                if (lidMapping) {
-                    try {
-                        // ✅ AWAIT the promise
-                        const resolvedPN = await lidMapping.getPNForLID(phone.replace('lid_', '').split('@')[0]);
+
+            // Prefer contact.phoneNumber first (most reliable in LID environment)
+            let phone = null;
+            if (contact.phoneNumber) {
+                phone = contact.phoneNumber.split('@')[0];
+            } else if (contact.id) {
+                phone = contact.id.split('@')[0];
+            } else {
+                phone = jid.split('@')[0];
+            }
+
+            // Try to resolve LID to PN using Baileys internal mapping
+            const lidMapping = this.whatsappBot.sock?.signalRepository?.lidMapping;
+            if (lidMapping && phone) {
+                try {
+                    // If phone doesn't look like a regular number (not all digits)
+                    if (!/^\d{6,15}$/.test(phone)) {
+                        const resolvedPN = await lidMapping.getPNForLID(phone);
                         if (resolvedPN) {
                             logger.debug(`🔍 Resolved LID ${phone} → ${resolvedPN}`);
-                            phone = resolvedPN;
+                            phone = resolvedPN.replace(/@s\.whatsapp\.net$/, '');
                         }
-                    } catch (error) {
-                        logger.debug(`Failed to resolve LID for ${phone}:`, error.message);
                     }
+                } catch (error) {
+                    logger.debug(`Failed to resolve LID for ${phone}:`, error.message);
                 }
             }
 
-            // 🏷️ Extract name from contact – prioritize saved contact name
+            // Skip if phone is still invalid
+            if (!phone || phone.length < 6) {
+                logger.debug(`⏭️ Skipping contact with invalid phone: ${jid}`);
+                continue;
+            }
+
+            // Extract best available name
+            let contactName = null;
             if (contact.name && contact.name !== phone && !contact.name.startsWith('+') && contact.name.length > 2) {
                 contactName = contact.name;
             } else if (contact.notify && contact.notify !== phone && !contact.notify.startsWith('+') && contact.notify.length > 2) {
@@ -421,24 +435,31 @@ async syncContacts() {
             } else if (contact.verifiedName && contact.verifiedName !== phone && contact.verifiedName.length > 2) {
                 contactName = contact.verifiedName;
             }
-            
-            // 💾 Save mapping if new or updated
-            if (contactName) {
-                const existingName = this.contactMappings.get(phone);
-                if (existingName !== contactName) {
-                    await this.saveContactMapping(phone, contactName);
-                    syncedCount++;
-                    logger.debug(`📞 Synced contact: ${phone} -> ${contactName}`);
-                }
+
+            // Save all contacts with valid phone numbers to DB (even without names)
+            const existingName = this.contactMappings.get(phone);
+
+            // Always save/update if:
+            // 1. Contact doesn't exist in our DB
+            // 2. Contact name has changed
+            // 3. Contact has a name and we didn't have it before
+            if (!existingName || (contactName && existingName !== contactName)) {
+                await this.saveContactMapping(phone, contactName || `+${phone}`);
+                savedCount++;
+                syncedCount++;
+                logger.debug(`📞 Saved contact: ${phone} -> ${contactName || 'No name'}`);
+            } else if (!contactName && existingName) {
+                // Keep existing name in cache
+                syncedCount++;
             }
         }
-        
-        logger.info(`✅ Synced ${syncedCount} new/updated contacts (Total: ${this.contactMappings.size})`);
-        
-        if (syncedCount > 0) {
+
+        logger.info(`✅ Synced ${syncedCount} contacts, saved ${savedCount} new/updated (Total: ${this.contactMappings.size})`);
+
+        if (savedCount > 0) {
             await this.updateTopicNames();
         }
-        
+
     } catch (error) {
         logger.error('❌ Failed to sync contacts:', error);
     }
